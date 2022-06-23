@@ -1,0 +1,318 @@
+title: "Experiments with SetFit & Few-Shot Classification"
+description: >
+  This project is an experiment with [spaCy](https://spacy.io)
+  and few-shot text classification using
+  [SetFit](http://archive.today/Kelkb)
+
+  Run project in colab for GPU: 
+  [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1CvGEZC0I9_v8gWrBxSJQ4Z8JGPJz-HYb?usp=sharing)
+
+vars:
+  # configs
+  configs:
+    gpu_base: "configs/config.gpu.base.cfg"
+    gpu_setfit: "configs/config.gpu.setfit.cfg"
+    cpu_base: "configs/config.cpu.base.cfg"
+    cpu_acc: "configs/config.cpu.acc.cfg"
+    templates:
+      wandb: "configs/wandb.template"
+  # setfit
+  base_model: "sentence-transformers/all-mpnet-base-v2"
+  model_name: "models/sst_setfit"
+  # data
+  train_raw: "assets/sst-train-raw.tsv"
+  dev_raw: "assets/sst-dev-raw.tsv"
+  train_clean: "corpus/train"
+  dev_clean: "corpus/dev.spacy"
+  # global
+  gpu_id: -1
+  seed: 1234
+  # training
+  n_train1: 128
+  n_train2: 256
+  n_train3: 512
+  n_train4: 1024
+  train_epochs: 100
+  eval_frequency: 10
+  patience: 80
+spacy_version: ">=3.2.1,<4.0.0"
+
+directories: ["assets", "configs", "scripts", "corpus", "models"]
+
+assets:
+  - dest: "${vars.train_raw}"
+    url: https://raw.githubusercontent.com/clairett/pytorch-sentiment-classification/master/data/SST2/train.tsv
+    description: "SST2 Training Data"
+  - dest: "${vars.dev_raw}"
+    url: https://raw.githubusercontent.com/clairett/pytorch-sentiment-classification/master/data/SST2/test.tsv
+    description: "SST2 Test Data"
+
+workflows:
+  setup:
+    - preprocess
+    - generate_configs
+  setup_setfit:
+    - preprocess
+    - generate_configs
+    - pretrain_setfit
+
+commands:
+  - name: preprocess
+    help: "Convert data into spacy format"
+    script:
+      - python scripts/process_data.py ${vars.train_raw} ${vars.train_clean}-${vars.n_train1}.spacy --sample=${vars.n_train1} --seed=${vars.seed}
+      - python scripts/process_data.py ${vars.train_raw} ${vars.train_clean}-${vars.n_train2}.spacy --sample=${vars.n_train2} --seed=${vars.seed}
+      - python scripts/process_data.py ${vars.train_raw} ${vars.train_clean}-${vars.n_train3}.spacy --sample=${vars.n_train3} --seed=${vars.seed}
+      - python scripts/process_data.py ${vars.train_raw} ${vars.train_clean}-${vars.n_train4}.spacy --sample=${vars.n_train4} --seed=${vars.seed}
+      - python scripts/process_data.py ${vars.dev_raw} ${vars.dev_clean}
+    outputs:
+      - ${vars.train_clean}-${vars.n_train1}
+      - ${vars.train_clean}-${vars.n_train2}
+      - ${vars.train_clean}-${vars.n_train3}
+      - ${vars.train_clean}-${vars.n_train4}
+      - ${vars.dev_clean}
+  - name: pretrain_setfit
+    help: "Pretrain Setfit Model"
+    script:
+      - python scripts/train_setfit.py ${vars.base_model} ${vars.model_name}-${vars.n_train1} ${vars.train_clean}-${vars.n_train1}.spacy
+      - python scripts/train_setfit.py ${vars.base_model} ${vars.model_name}-${vars.n_train2} ${vars.train_clean}-${vars.n_train2}.spacy
+      - python scripts/train_setfit.py ${vars.base_model} ${vars.model_name}-${vars.n_train3} ${vars.train_clean}-${vars.n_train3}.spacy
+      - python scripts/train_setfit.py ${vars.base_model} ${vars.model_name}-${vars.n_train4} ${vars.train_clean}-${vars.n_train4}.spacy
+    deps:
+      - ${vars.train_clean}-${vars.n_train1}.spacy
+      - ${vars.train_clean}-${vars.n_train2}.spacy
+      - ${vars.train_clean}-${vars.n_train3}.spacy
+      - ${vars.train_clean}-${vars.n_train4}.spacy
+  - name: generate_configs
+    help: "Create the configs for training comparison"
+    script:
+      - >-
+        python -m spacy init config ${vars.configs.gpu_base} -F --lang en
+        --pipeline textcat
+        --optimize accuracy
+        --gpu
+      - >-
+        python -m spacy init config ${vars.configs.cpu_base} -F --lang en
+        --pipeline textcat
+        --optimize efficiency
+      - >-
+        python -m spacy init config ${vars.configs.cpu_acc} -F --lang en
+        --pipeline textcat
+        --optimize accuracy
+      - cp ${vars.configs.gpu_base} ${vars.configs.gpu_setfit}
+      # https://backreference.org/2010/02/20/using-different-delimiters-in-sed/
+      # https://singhkays.com/blog/sed-error-i-expects-followed-by-text/
+      - sed -i'' -e 's,name = .*,name = "${vars.model_name}",g' ${vars.configs.gpu_setfit}
+      - >-
+        find configs/ -type f -name '*.cfg' -exec
+        sed -i'' -e 's,max_epochs = .*,max_epochs = ${vars.train_epochs},g' {} +
+      - >-
+        find configs/ -type f -name '*.cfg' -exec
+        sed -i'' -e 's,eval_frequency = .*,eval_frequency = ${vars.eval_frequency},g' {} +
+      - >-
+        find configs/ -type f -name '*.cfg' -exec
+        sed -i'' -e 's,patience = .*,patience = ${vars.patience},g' {} +
+      - >-
+        find configs/ -type f -name '*.cfg' -exec
+        python scripts/replace_config_section.py ${vars.configs.templates.wandb} {} \;
+      - find configs/ -type f -name '*.cfg-e' -exec rm {} +
+    outputs:
+      - ${vars.configs.cpu_base}
+      - ${vars.configs.cpu_acc}
+      - ${vars.configs.gpu_base}
+      - ${vars.configs.gpu_setfit}
+  - name: eval_setfit
+    help: "Evaluate the setfit model"
+    script:
+      - python scripts/eval_setfit.py ${vars.model_name}-${vars.n_train1} ${vars.dev_clean}
+      - python scripts/eval_setfit.py ${vars.model_name}-${vars.n_train2} ${vars.dev_clean}
+      - python scripts/eval_setfit.py ${vars.model_name}-${vars.n_train3} ${vars.dev_clean}
+      - python scripts/eval_setfit.py ${vars.model_name}-${vars.n_train4} ${vars.dev_clean}
+  - name: train_cpu
+    help: "Train the CPU based models"
+    script:
+      - >-
+        python -m spacy train ${vars.configs.cpu_base}
+        --paths.train ${vars.train_clean}-${vars.n_train1}.spacy
+        --paths.dev ${vars.dev_clean}
+        --output models/cpu-efficiency-${vars.n_train1}/
+      - >-
+        python -m spacy train ${vars.configs.cpu_base}
+        --paths.train ${vars.train_clean}-${vars.n_train2}.spacy
+        --paths.dev ${vars.dev_clean}
+        --output models/cpu-efficiency-${vars.n_train2}/
+      - >-
+        python -m spacy train ${vars.configs.cpu_base}
+        --paths.train ${vars.train_clean}-${vars.n_train3}.spacy
+        --paths.dev ${vars.dev_clean}
+        --output models/cpu-efficiency-${vars.n_train3}/
+      - >-
+        python -m spacy train ${vars.configs.cpu_base}
+        --paths.train ${vars.train_clean}-${vars.n_train4}.spacy
+        --paths.dev ${vars.dev_clean}
+        --output models/cpu-efficiency-${vars.n_train4}/
+    deps:
+      - ${vars.configs.cpu_base}
+      - ${vars.train_clean}-${vars.n_train1}.spacy
+      - ${vars.train_clean}-${vars.n_train2}.spacy
+      - ${vars.train_clean}-${vars.n_train3}.spacy
+      - ${vars.train_clean}-${vars.n_train4}.spacy
+      - ${vars.dev_clean}
+  - name: train_cpu_acc
+    help: "Train the CPU accuracy models"
+    script:
+      - >-
+        python -m spacy train ${vars.configs.cpu_acc}
+        --paths.train ${vars.train_clean}-${vars.n_train1}.spacy
+        --paths.dev ${vars.dev_clean}
+        --output models/cpu-acc-${vars.n_train1}/
+      - >-
+        python -m spacy train ${vars.configs.cpu_acc}
+        --paths.train ${vars.train_clean}-${vars.n_train2}.spacy
+        --paths.dev ${vars.dev_clean}
+        --output models/cpu-acc-${vars.n_train2}/
+      - >-
+        python -m spacy train ${vars.configs.cpu_acc}
+        --paths.train ${vars.train_clean}-${vars.n_train3}.spacy
+        --paths.dev ${vars.dev_clean}
+        --output models/cpu-acc-${vars.n_train3}/
+      - >-
+        python -m spacy train ${vars.configs.cpu_acc}
+        --paths.train ${vars.train_clean}-${vars.n_train4}.spacy
+        --paths.dev ${vars.dev_clean}
+        --output models/cpu-acc-${vars.n_train4}/
+    deps:
+      - ${vars.configs.cpu_acc}
+      - ${vars.train_clean}-${vars.n_train1}.spacy
+      - ${vars.train_clean}-${vars.n_train2}.spacy
+      - ${vars.train_clean}-${vars.n_train3}.spacy
+      - ${vars.train_clean}-${vars.n_train4}.spacy
+      - ${vars.dev_clean}
+  - name: train_gpu_base
+    help: "Train the GPU base (roberta) models"
+    script:
+      - >-
+        python -m spacy train ${vars.configs.gpu_base}
+        --paths.train ${vars.train_clean}-${vars.n_train1}.spacy
+        --paths.dev ${vars.dev_clean}
+        --output models/gpu-base-${vars.n_train1}/
+        --gpu-id 0
+      - >-
+        python -m spacy train ${vars.configs.gpu_base}
+        --paths.train ${vars.train_clean}-${vars.n_train2}.spacy
+        --paths.dev ${vars.dev_clean}
+        --output models/gpu-base-${vars.n_train2}/
+        --gpu-id 0
+      - >-
+        python -m spacy train ${vars.configs.gpu_base}
+        --paths.train ${vars.train_clean}-${vars.n_train3}.spacy
+        --paths.dev ${vars.dev_clean}
+        --output models/gpu-base-${vars.n_train3}/
+        --gpu-id 0
+      - >-
+        python -m spacy train ${vars.configs.gpu_base}
+        --paths.train ${vars.train_clean}-${vars.n_train4}.spacy
+        --paths.dev ${vars.dev_clean}
+        --output models/gpu-base-${vars.n_train4}/
+        --gpu-id 0
+    deps:
+      - ${vars.configs.gpu_base}
+      - ${vars.train_clean}-${vars.n_train1}.spacy
+      - ${vars.train_clean}-${vars.n_train2}.spacy
+      - ${vars.train_clean}-${vars.n_train3}.spacy
+      - ${vars.train_clean}-${vars.n_train4}.spacy
+      - ${vars.dev_clean}
+  - name: train_gpu_setfit
+    help: "Train the GPU SetFit models"
+    script:
+      - >-
+        python -m spacy train ${vars.configs.gpu_setfit}
+        --paths.train ${vars.train_clean}-${vars.n_train1}.spacy
+        --paths.dev ${vars.dev_clean}
+        --output models/gpu-setfit-${vars.n_train1}/
+        --gpu-id 0
+      - >-
+        python -m spacy train ${vars.configs.gpu_setfit}
+        --paths.train ${vars.train_clean}-${vars.n_train2}.spacy
+        --paths.dev ${vars.dev_clean}
+        --output models/gpu-setfit-${vars.n_train2}/
+        --gpu-id 0
+      - >-
+        python -m spacy train ${vars.configs.gpu_setfit}
+        --paths.train ${vars.train_clean}-${vars.n_train3}.spacy
+        --paths.dev ${vars.dev_clean}
+        --output models/gpu-setfit-${vars.n_train3}/
+        --gpu-id 0
+      - >-
+        python -m spacy train ${vars.configs.gpu_setfit}
+        --paths.train ${vars.train_clean}-${vars.n_train4}.spacy
+        --paths.dev ${vars.dev_clean}
+        --output models/gpu-setfit-${vars.n_train4}/
+        --gpu-id 0
+    deps:
+      - ${vars.configs.gpu_setfit}
+      - ${vars.train_clean}-${vars.n_train1}.spacy
+      - ${vars.train_clean}-${vars.n_train2}.spacy
+      - ${vars.train_clean}-${vars.n_train3}.spacy
+      - ${vars.train_clean}-${vars.n_train4}.spacy
+      - ${vars.dev_clean}
+  - name: package_gpu_models
+    help: "Package GPU Models"
+    script:
+      - >-
+         python -m spacy package
+         ./models/gpu-setfit-${vars.n_train1}/model-best
+         ./models/build 
+         --name gpu_setfit_${vars.n_train1}
+         --build wheel
+      - >-
+         python -m spacy package
+         ./models/gpu-setfit-${vars.n_train2}/model-best
+         ./models/build 
+         --name gpu_setfit_${vars.n_train2}
+         --build wheel
+      - >-
+         python -m spacy package
+         ./models/gpu-setfit-${vars.n_train3}/model-best
+         ./models/build 
+         --name gpu_setfit_${vars.n_train3}
+         --build wheel
+      - >-
+         python -m spacy package
+         ./models/gpu-setfit-${vars.n_train4}/model-best
+         ./models/build 
+         --name gpu_setfit_${vars.n_train4}
+         --build wheel
+      - >-
+         python -m spacy package
+         ./models/gpu-base-${vars.n_train1}/model-best
+         ./models/build 
+         --name gpu_base_${vars.n_train1}
+         --build wheel
+      - >-
+         python -m spacy package
+         ./models/gpu-base-${vars.n_train2}/model-best
+         ./models/build 
+         --name gpu_base_${vars.n_train2}
+         --build wheel
+      - >-
+         python -m spacy package
+         ./models/gpu-base-${vars.n_train3}/model-best
+         ./models/build 
+         --name gpu_base_${vars.n_train3}
+         --build wheel
+      - >-
+         python -m spacy package
+         ./models/gpu-base-${vars.n_train4}/model-best
+         ./models/build 
+         --name gpu_base_${vars.n_train4}
+         --build wheel
+    deps:
+      - ./models/gpu-setfit-${vars.n_train1}/model-best
+      - ./models/gpu-setfit-${vars.n_train2}/model-best
+      - ./models/gpu-setfit-${vars.n_train3}/model-best
+      - ./models/gpu-setfit-${vars.n_train4}/model-best
+      - ./models/gpu-base-${vars.n_train1}/model-best
+      - ./models/gpu-base-${vars.n_train2}/model-best
+      - ./models/gpu-base-${vars.n_train3}/model-best
+      - ./models/gpu-base-${vars.n_train4}/model-best
